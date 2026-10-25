@@ -1,10 +1,12 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections;
+using Microsoft.Extensions.Primitives;
 
 namespace Bedrock.Framework.Experimental.Protocols.WebSockets;
 
@@ -34,14 +36,6 @@ public static class WebSocketClientProtocol
             throw new ArgumentException("The URI must be an absolute ws://, wss://, http:// or https:// URI.", nameof(uri));
         }
 
-        foreach (var protocol in options.SubProtocols)
-        {
-            if (!WebSocketHandshake.IsToken(protocol))
-            {
-                throw new ArgumentException($"'{protocol}' is not a valid subprotocol token.", nameof(options));
-            }
-        }
-
         var key = WebSocketHandshake.GenerateKey();
         var target = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
 
@@ -51,25 +45,8 @@ public static class WebSocketClientProtocol
         request.Append("Upgrade: websocket\r\n");
         request.Append("Connection: Upgrade\r\n");
         request.Append(WebSocketHandshake.HeaderKey).Append(": ").Append(key).Append("\r\n");
-        request.Append(WebSocketHandshake.HeaderVersion).Append(": ").Append(WebSocketHandshake.SupportedVersion).Append("\r\n");
-        if (options.Origin != null)
+        foreach (var (name, value) in GetCommonRequestHeaders(options))
         {
-            request.Append(WebSocketHandshake.HeaderOrigin).Append(": ").Append(options.Origin).Append("\r\n");
-        }
-        if (options.SubProtocols.Count > 0)
-        {
-            request.Append(WebSocketHandshake.HeaderProtocol).Append(": ").Append(string.Join(", ", options.SubProtocols)).Append("\r\n");
-        }
-        if (options.Compression != null)
-        {
-            request.Append(WebSocketHandshake.HeaderExtensions).Append(": ").Append(PerMessageDeflateParameters.CreateClientOffer(options.Compression)).Append("\r\n");
-        }
-        foreach (var (name, value) in options.Headers)
-        {
-            if (!WebSocketHandshake.IsToken(name) || value.AsSpan().IndexOfAny('\r', '\n') >= 0)
-            {
-                throw new ArgumentException($"The header '{name}' is not valid.", nameof(options));
-            }
             request.Append(name).Append(": ").Append(value).Append("\r\n");
         }
         request.Append("\r\n");
@@ -109,8 +86,20 @@ public static class WebSocketClientProtocol
             throw Invalid("The server response has a missing or incorrect Sec-WebSocket-Accept.");
         }
 
+        var (subProtocol, compression) = ValidateNegotiation(status, head.Headers, options);
+
+        return WebSocketSession.Create(connection.Transport, connection, isServer: false, options, subProtocol, compression);
+    }
+    /// <summary>
+    /// Validates the subprotocol and extensions a server selected (RFC 6455 4.1, RFC 7692 7.1). Shared with RFC 8441.
+    /// </summary>
+    internal static (string SubProtocol, PerMessageDeflateParameters Compression) ValidateNegotiation(int status, IReadOnlyDictionary<string, StringValues> headers, WebSocketClientOptions options)
+    {
+        WebSocketHandshakeException Invalid(string message) => new(status, message, headers);
+        StringValues Header(string name) => headers.TryGetValue(name, out var value) ? value : StringValues.Empty;
+
         string subProtocol = null;
-        var protocols = WebSocketHandshake.ParseTokenList(head[WebSocketHandshake.HeaderProtocol]);
+        var protocols = WebSocketHandshake.ParseTokenList(Header(WebSocketHandshake.HeaderProtocol));
         if (protocols.Count > 1)
         {
             throw Invalid("The server selected more than one subprotocol.");
@@ -127,7 +116,7 @@ public static class WebSocketClientProtocol
         PerMessageDeflateParameters compression = null;
         try
         {
-            foreach (var extension in WebSocketExtension.Parse(head[WebSocketHandshake.HeaderExtensions]))
+            foreach (var extension in WebSocketExtension.Parse(Header(WebSocketHandshake.HeaderExtensions)))
             {
                 if (options.Compression == null || compression != null
                     || !string.Equals(extension.Name, PerMessageDeflateParameters.ExtensionName, StringComparison.OrdinalIgnoreCase))
@@ -143,6 +132,42 @@ public static class WebSocketClientProtocol
             throw Invalid(ex.Message);
         }
 
-        return WebSocketSession.Create(connection, isServer: false, options, subProtocol, compression);
+        return (subProtocol, compression);
+    }
+
+    /// <summary>
+    /// Builds the request headers common to RFC 6455 and RFC 8441 handshakes.
+    /// </summary>
+    internal static IEnumerable<KeyValuePair<string, string>> GetCommonRequestHeaders(WebSocketClientOptions options)
+    {
+        foreach (var protocol in options.SubProtocols)
+        {
+            if (!WebSocketHandshake.IsToken(protocol))
+            {
+                throw new ArgumentException($"'{protocol}' is not a valid subprotocol token.", nameof(options));
+            }
+        }
+
+        yield return new(WebSocketHandshake.HeaderVersion, WebSocketHandshake.SupportedVersion);
+        if (options.Origin != null)
+        {
+            yield return new(WebSocketHandshake.HeaderOrigin, options.Origin);
+        }
+        if (options.SubProtocols.Count > 0)
+        {
+            yield return new(WebSocketHandshake.HeaderProtocol, string.Join(", ", options.SubProtocols));
+        }
+        if (options.Compression != null)
+        {
+            yield return new(WebSocketHandshake.HeaderExtensions, PerMessageDeflateParameters.CreateClientOffer(options.Compression));
+        }
+        foreach (var (name, value) in options.Headers)
+        {
+            if (!WebSocketHandshake.IsToken(name) || value == null || value.AsSpan().IndexOfAny('\r', '\n') >= 0)
+            {
+                throw new ArgumentException($"The header '{name}' is not valid.", nameof(options));
+            }
+            yield return new(name, value);
+        }
     }
 }

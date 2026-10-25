@@ -72,8 +72,11 @@ public sealed class WebSocketSession : IAsyncDisposable
     private long _lastReceiveTimestamp = Environment.TickCount64;
     private readonly Task _keepAliveTask = Task.CompletedTask;
 
-    private WebSocketSession(IDuplexPipe transport, bool isServer, WebSocketSessionOptions options, string subProtocol, PerMessageDeflateParameters deflate, ConnectionContext connection)
+    private readonly IAsyncDisposable _owner;
+
+    private WebSocketSession(IDuplexPipe transport, bool isServer, WebSocketSessionOptions options, string subProtocol, PerMessageDeflateParameters deflate, ConnectionContext connection, IAsyncDisposable owner)
     {
+        _owner = owner;
         ArgumentNullException.ThrowIfNull(transport);
         options ??= new WebSocketSessionOptions();
         options.Validate();
@@ -112,10 +115,10 @@ public sealed class WebSocketSession : IAsyncDisposable
     /// <param name="subProtocol">The negotiated subprotocol, if any.</param>
     /// <param name="compression">The negotiated permessage-deflate parameters, or null if compression was not negotiated.</param>
     public static WebSocketSession Create(IDuplexPipe transport, bool isServer, WebSocketSessionOptions options = null, string subProtocol = null, PerMessageDeflateParameters compression = null)
-        => new(transport, isServer, options, subProtocol, compression, connection: null);
+        => new(transport, isServer, options, subProtocol, compression, connection: null, owner: null);
 
-    internal static WebSocketSession Create(ConnectionContext connection, bool isServer, WebSocketSessionOptions options, string subProtocol, PerMessageDeflateParameters compression)
-        => new(connection.Transport, isServer, options, subProtocol, compression, connection);
+    internal static WebSocketSession Create(IDuplexPipe transport, ConnectionContext connection, bool isServer, WebSocketSessionOptions options, string subProtocol, PerMessageDeflateParameters compression, IAsyncDisposable owner = null)
+        => new(transport, isServer, options, subProtocol, compression, connection, owner);
 
     /// <summary>
     /// The underlying connection, when the session was created by the Bedrock client or server handshake.
@@ -1120,6 +1123,11 @@ public sealed class WebSocketSession : IAsyncDisposable
         _deflater?.Dispose();
         _inflater?.Dispose();
         _abortCts.Dispose();
+
+        if (_owner != null)
+        {
+            await _owner.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     #endregion

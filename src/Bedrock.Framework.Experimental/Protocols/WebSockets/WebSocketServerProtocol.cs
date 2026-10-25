@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.IO.Pipelines;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -10,7 +11,9 @@ using Microsoft.AspNetCore.Connections;
 namespace Bedrock.Framework.Experimental.Protocols.WebSockets;
 
 /// <summary>
-/// The server side of the RFC 6455 opening handshake over an HTTP/1.1 connection.
+/// The server side of the WebSocket opening handshake: RFC 6455 over an HTTP/1.1 connection, or, when the connection
+/// carries an <see cref="IWebSocketUpgradeFeature"/>, an upgrade already parsed by an HTTP host (including RFC 8441
+/// extended CONNECT over HTTP/2).
 /// </summary>
 /// <example>
 /// <code>
@@ -24,6 +27,7 @@ public sealed class WebSocketServerProtocol
 {
     private readonly ConnectionContext _connection;
     private readonly WebSocketServerOptions _options;
+    private readonly IWebSocketUpgradeFeature _upgradeFeature;
     private bool _responded;
 
     public WebSocketServerProtocol(ConnectionContext connection, WebSocketServerOptions options = null)
@@ -31,6 +35,7 @@ public sealed class WebSocketServerProtocol
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
         _options = options ?? new WebSocketServerOptions();
         _options.Validate();
+        _upgradeFeature = connection.Features?.Get<IWebSocketUpgradeFeature>();
     }
 
     /// <summary>
@@ -49,29 +54,50 @@ public sealed class WebSocketServerProtocol
             return Request;
         }
 
+        var isExtendedConnect = _upgradeFeature?.IsExtendedConnect ?? false;
         try
         {
-            var head = await HttpHead.ReadAsync(_connection.Transport.Input, isRequest: true, _options.MaxHandshakeSize, cancellationToken).ConfigureAwait(false)
-                ?? throw new WebSocketHandshakeException(null, "The connection was closed before an upgrade request was received.");
+            HttpHead head;
+            if (_upgradeFeature != null)
+            {
+                head = new HttpHead { First = _upgradeFeature.Method, Second = _upgradeFeature.RequestTarget, Third = _upgradeFeature.HttpVersion };
+                foreach (var header in _upgradeFeature.Headers)
+                {
+                    head.Headers[header.Key] = header.Value;
+                }
+            }
+            else
+            {
+                head = await HttpHead.ReadAsync(_connection.Transport.Input, isRequest: true, _options.MaxHandshakeSize, cancellationToken).ConfigureAwait(false)
+                    ?? throw new WebSocketHandshakeException(null, "The connection was closed before an upgrade request was received.");
+            }
 
-            Request = Validate(head);
+            Request = isExtendedConnect ? ValidateExtendedConnect(head) : ValidateUpgrade(head);
             return Request;
         }
         catch (WebSocketHandshakeException ex) when (ex.StatusCode is int status)
         {
-            var extraHeaders = status switch
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (status == 426 || (isExtendedConnect && ex.Data.Contains(UnsupportedVersionMarker)))
             {
-                426 => "Sec-WebSocket-Version: " + WebSocketHandshake.SupportedVersion + "\r\n",
-                405 => "Allow: GET\r\n",
-                _ => null
-            };
+                headers[WebSocketHandshake.HeaderVersion] = WebSocketHandshake.SupportedVersion;
+            }
+            if (status == 405)
+            {
+                headers["Allow"] = isExtendedConnect ? "CONNECT" : "GET";
+            }
 
-            await WriteErrorResponseAsync(status, extraHeaders, cancellationToken).ConfigureAwait(false);
+            await SendErrorAsync(status, headers, cancellationToken).ConfigureAwait(false);
             throw;
         }
     }
 
-    private WebSocketUpgradeRequest Validate(HttpHead head)
+    private const string UnsupportedVersionMarker = "UnsupportedVersion";
+
+    /// <summary>
+    /// RFC 6455 section 4.2.1.
+    /// </summary>
+    private WebSocketUpgradeRequest ValidateUpgrade(HttpHead head)
     {
         if (!string.Equals(head.Third, "HTTP/1.1", StringComparison.Ordinal))
         {
@@ -98,11 +124,7 @@ public sealed class WebSocketServerProtocol
             throw new WebSocketHandshakeException(400, "The upgrade request is missing 'Connection: Upgrade'.");
         }
 
-        var version = head[WebSocketHandshake.HeaderVersion];
-        if (version.Count != 1 || !string.Equals(version.ToString().Trim(), WebSocketHandshake.SupportedVersion, StringComparison.Ordinal))
-        {
-            throw new WebSocketHandshakeException(426, $"Unsupported Sec-WebSocket-Version '{version}'. Only version 13 is supported.");
-        }
+        ValidateVersion(head, status: 426);
 
         var key = head[WebSocketHandshake.HeaderKey];
         if (key.Count != 1 || !WebSocketHandshake.IsValidKey(key.ToString()))
@@ -110,6 +132,41 @@ public sealed class WebSocketServerProtocol
             throw new WebSocketHandshakeException(400, "The upgrade request has a missing or invalid Sec-WebSocket-Key.");
         }
 
+        return CreateRequest(head, key.ToString().Trim());
+    }
+
+    /// <summary>
+    /// RFC 8441 sections 4 and 5: an extended CONNECT with :protocol = websocket. There is no Sec-WebSocket-Key.
+    /// </summary>
+    private WebSocketUpgradeRequest ValidateExtendedConnect(HttpHead head)
+    {
+        if (!string.Equals(head.First, "CONNECT", StringComparison.Ordinal))
+        {
+            throw new WebSocketHandshakeException(405, $"WebSockets over HTTP/2 require the CONNECT method, but the request used '{head.First}'.");
+        }
+
+        if (!string.Equals(_upgradeFeature.Protocol, "websocket", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new WebSocketHandshakeException(400, $"The extended CONNECT :protocol '{_upgradeFeature.Protocol}' is not 'websocket'.");
+        }
+
+        ValidateVersion(head, status: 400);
+        return CreateRequest(head, key: null);
+    }
+
+    private static void ValidateVersion(HttpHead head, int status)
+    {
+        var version = head[WebSocketHandshake.HeaderVersion];
+        if (version.Count != 1 || !string.Equals(version.ToString().Trim(), WebSocketHandshake.SupportedVersion, StringComparison.Ordinal))
+        {
+            var ex = new WebSocketHandshakeException(status, $"Unsupported Sec-WebSocket-Version '{version}'. Only version 13 is supported.");
+            ex.Data[UnsupportedVersionMarker] = true;
+            throw ex;
+        }
+    }
+
+    private WebSocketUpgradeRequest CreateRequest(HttpHead head, string key)
+    {
         var origin = head[WebSocketHandshake.HeaderOrigin];
         if (_options.AllowedOrigins.Count > 0 && origin.Count > 0
             && !_options.AllowedOrigins.Any(allowed => string.Equals(allowed, origin.ToString(), StringComparison.OrdinalIgnoreCase)))
@@ -128,11 +185,11 @@ public sealed class WebSocketServerProtocol
         }
 
         var subProtocols = WebSocketHandshake.ParseTokenList(head[WebSocketHandshake.HeaderProtocol]);
-        return new WebSocketUpgradeRequest(head, key.ToString().Trim(), subProtocols, extensions);
+        return new WebSocketUpgradeRequest(head, key, subProtocols, extensions);
     }
 
     /// <summary>
-    /// Accepts the upgrade by sending 101 Switching Protocols, and returns the open session.
+    /// Accepts the upgrade (101 Switching Protocols for HTTP/1.1, 200 for HTTP/2) and returns the open session.
     /// </summary>
     /// <param name="subProtocol">The subprotocol to select. It must be one the client offered. When null, the first of
     /// <see cref="WebSocketServerOptions.SubProtocols"/> that the client offered is selected, if any.</param>
@@ -160,6 +217,28 @@ public sealed class WebSocketServerProtocol
             compression = PerMessageDeflateParameters.NegotiateAsServer(request.Extensions, _options.Compression);
         }
 
+        _responded = true;
+
+        if (_upgradeFeature != null)
+        {
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!_upgradeFeature.IsExtendedConnect)
+            {
+                headers[WebSocketHandshake.HeaderAccept] = WebSocketHandshake.ComputeAcceptKey(request.Key);
+            }
+            if (subProtocol != null)
+            {
+                headers[WebSocketHandshake.HeaderProtocol] = subProtocol;
+            }
+            if (compression != null)
+            {
+                headers[WebSocketHandshake.HeaderExtensions] = compression.ToString();
+            }
+
+            var transport = await _upgradeFeature.AcceptAsync(headers, cancellationToken).ConfigureAwait(false);
+            return WebSocketSession.Create(transport, _connection, isServer: true, _options, subProtocol, compression);
+        }
+
         var response = new StringBuilder();
         response.Append("HTTP/1.1 101 Switching Protocols\r\n");
         response.Append("Upgrade: websocket\r\n");
@@ -175,10 +254,9 @@ public sealed class WebSocketServerProtocol
         }
         response.Append("\r\n");
 
-        _responded = true;
         await WriteAsync(response.ToString(), cancellationToken).ConfigureAwait(false);
 
-        return WebSocketSession.Create(_connection, isServer: true, _options, subProtocol, compression);
+        return WebSocketSession.Create(_connection.Transport, _connection, isServer: true, _options, subProtocol, compression);
     }
 
     /// <summary>
@@ -192,7 +270,7 @@ public sealed class WebSocketServerProtocol
         }
 
         EnsureNotResponded();
-        return WriteErrorResponseAsync(statusCode, null, cancellationToken);
+        return SendErrorAsync(statusCode, null, cancellationToken);
     }
 
     /// <summary>
@@ -213,7 +291,7 @@ public sealed class WebSocketServerProtocol
         }
     }
 
-    private async ValueTask WriteErrorResponseAsync(int statusCode, string extraHeaders, CancellationToken cancellationToken)
+    private async ValueTask SendErrorAsync(int statusCode, IReadOnlyDictionary<string, string> headers, CancellationToken cancellationToken)
     {
         if (_responded)
         {
@@ -221,10 +299,27 @@ public sealed class WebSocketServerProtocol
         }
 
         _responded = true;
-        var response = $"HTTP/1.1 {statusCode} {ReasonPhrase(statusCode)}\r\nConnection: close\r\nContent-Length: 0\r\n{extraHeaders}\r\n";
         try
         {
-            await WriteAsync(response, cancellationToken).ConfigureAwait(false);
+            if (_upgradeFeature != null)
+            {
+                await _upgradeFeature.RejectAsync(statusCode, headers ?? new Dictionary<string, string>(), cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            var response = new StringBuilder();
+            response.Append("HTTP/1.1 ").Append(statusCode).Append(' ').Append(ReasonPhrase(statusCode)).Append("\r\n");
+            response.Append("Connection: close\r\nContent-Length: 0\r\n");
+            if (headers != null)
+            {
+                foreach (var (name, value) in headers)
+                {
+                    response.Append(name).Append(": ").Append(value).Append("\r\n");
+                }
+            }
+            response.Append("\r\n");
+
+            await WriteAsync(response.ToString(), cancellationToken).ConfigureAwait(false);
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
