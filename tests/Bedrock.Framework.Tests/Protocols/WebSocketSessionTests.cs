@@ -470,6 +470,114 @@ public class WebSocketSessionTests
         Assert.True(large.Payload.Length < 200);
     }
 
+    [Fact]
+    public async Task CompressedBlockWithBfinalDoesNotBreakLaterMessages()
+    {
+        // RFC 7692 7.2.3.4: a sender may end a message with a BFINAL block even with context takeover
+        var (ours, peer) = CreateRawPair();
+        await using var server = WebSocketSession.Create(ours, isServer: true, NoKeepAlive(), compression: new PerMessageDeflateParameters());
+
+        await WriteRawFrameAsync(peer.Output, WebSocketOpcode.Text, fin: true, DeflateFinal("hello"u8.ToArray()), rsvBits: 0x40);
+        await WriteRawFrameAsync(peer.Output, WebSocketOpcode.Text, fin: true, DeflateFinal("world"u8.ToArray()), rsvBits: 0x40);
+
+        Assert.Equal("hello", (await server.ReadMessageAsync().AsTask().WaitAsync(Timeout)).GetText());
+        Assert.Equal("world", (await server.ReadMessageAsync().AsTask().WaitAsync(Timeout)).GetText());
+    }
+
+    [Fact]
+    public async Task DataAfterBfinalCountsAgainstTheMessageSizeLimit()
+    {
+        var (ours, peer) = CreateRawPair();
+        var options = NoKeepAlive();
+        options.MaxMessageSize = 64 * 1024;
+        await using var server = WebSocketSession.Create(ours, isServer: true, options, compression: new PerMessageDeflateParameters());
+
+        var writes = Task.Run(async () =>
+        {
+            await WriteRawFrameAsync(peer.Output, WebSocketOpcode.Binary, fin: false, DeflateFinal([1]), rsvBits: 0x40);
+            var junk = new byte[32 * 1024];
+            for (var i = 0; i < 16; i++)
+            {
+                await WriteRawFrameAsync(peer.Output, WebSocketOpcode.Continuation, fin: false, junk);
+            }
+        });
+
+        await Assert.ThrowsAsync<WebSocketException>(async () =>
+        {
+            while (true)
+            {
+                await server.ReadAsync(new byte[4096]).AsTask().WaitAsync(Timeout);
+            }
+        });
+        Assert.Equal(WebSocketCloseStatus.MessageTooBig, server.CloseStatus);
+        _ = writes;
+    }
+
+    [Fact]
+    public async Task LargeCompressedMessagesDecompressIncrementallyIntoSmallReads()
+    {
+        var (ours, peerStream) = CreatePair();
+        await using var server = WebSocketSession.Create(ours, isServer: true, NoKeepAlive(), compression: new PerMessageDeflateParameters());
+        using var client = WebSocket.CreateFromStream(peerStream, BclOptions(isServer: false, compress: true));
+
+        // 4 MiB that compresses to a few KB; read 16 bytes at a time
+        var payload = new byte[4 * 1024 * 1024];
+        for (var i = 0; i < payload.Length; i++)
+        {
+            payload[i] = (byte)(i / 4096);
+        }
+
+        for (var message = 0; message < 2; message++)
+        {
+            var send = client.SendAsync(payload, WebSocketMessageType.Binary, true, default);
+            var received = new MemoryStream();
+            var small = new byte[16 * 1024];
+            WebSocketReadResult result;
+            do
+            {
+                result = await server.ReadAsync(small).AsTask().WaitAsync(Timeout);
+                received.Write(small, 0, result.Count);
+            }
+            while (!result.EndOfMessage);
+
+            await send.WaitAsync(Timeout);
+            Assert.Equal(payload, received.ToArray());
+        }
+    }
+
+    [Fact]
+    public async Task PeerThatStopsReadingCannotWedgeCloseOrKeepAlive()
+    {
+        var options = new PipeOptions(pauseWriterThreshold: 1024, resumeWriterThreshold: 512, useSynchronizationContext: false);
+        var pair = DuplexPipe.CreateConnectionPair(options, options);
+        var sessionOptions = new WebSocketSessionOptions
+        {
+            KeepAliveInterval = TimeSpan.FromMilliseconds(100),
+            KeepAliveTimeout = TimeSpan.FromMilliseconds(200),
+            CloseTimeout = TimeSpan.FromMilliseconds(300),
+        };
+        await using var server = WebSocketSession.Create(pair.Transport, isServer: true, sessionOptions);
+
+        // The peer never reads, so this send blocks on back-pressure while holding the write lock
+        var send = server.SendAsync(new byte[1024 * 1024], WebSocketMessageType.Binary).AsTask();
+
+        var close = server.CloseAsync(WebSocketCloseStatus.NormalClosure).AsTask();
+        await close.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketState.Aborted, server.State);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => send.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    private static byte[] DeflateFinal(byte[] data)
+    {
+        var output = new MemoryStream();
+        using (var deflate = new System.IO.Compression.DeflateStream(output, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
+        {
+            deflate.Write(data);
+        }
+        return output.ToArray();
+    }
+
     #region Helpers
 
     private static WebSocketSessionOptions NoKeepAlive() => new() { KeepAliveInterval = TimeSpan.Zero };

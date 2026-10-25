@@ -151,6 +151,10 @@ public static class WebSocketClientProtocol
         yield return new(WebSocketHandshake.HeaderVersion, WebSocketHandshake.SupportedVersion);
         if (options.Origin != null)
         {
+            if (HttpHead.ContainsControlCharacters(options.Origin))
+            {
+                throw new ArgumentException("The Origin contains control characters.", nameof(options));
+            }
             yield return new(WebSocketHandshake.HeaderOrigin, options.Origin);
         }
         if (options.SubProtocols.Count > 0)
@@ -163,7 +167,7 @@ public static class WebSocketClientProtocol
         }
         foreach (var (name, value) in options.Headers)
         {
-            if (!WebSocketHandshake.IsToken(name) || value == null || value.AsSpan().IndexOfAny('\r', '\n') >= 0)
+            if (!WebSocketHandshake.IsToken(name) || value == null || HttpHead.ContainsControlCharacters(value))
             {
                 throw new ArgumentException($"The header '{name}' is not valid.", nameof(options));
             }

@@ -300,15 +300,45 @@ internal sealed class PerMessageInflater : IDisposable
     }
 
     /// <summary>
-    /// Adds compressed payload bytes, unmasking them first if a masking encoder is supplied.
+    /// Whether the deflate stream ended (a BFINAL=1 block, RFC 7692 7.2.3.4). Any remaining input for the current
+    /// message is discarded and a new stream is started for the next message.
     /// </summary>
-    public void Push(ReadOnlySpan<byte> compressed) => _input.Append(compressed);
+    public bool IsFinished { get; private set; }
+
+    /// <summary>
+    /// The number of pushed bytes the decompressor has not consumed yet.
+    /// </summary>
+    public int BufferedInput => _input.Available;
+
+    /// <summary>
+    /// Adds compressed payload bytes.
+    /// </summary>
+    public void Push(ReadOnlySpan<byte> compressed)
+    {
+        if (!IsFinished)
+        {
+            _input.Append(compressed);
+        }
+    }
 
     /// <summary>
     /// Unmasks into the input buffer directly, without touching the source memory.
     /// </summary>
     internal void Push(ReadOnlySpan<byte> masked, ref WebSocketPayloadEncoder encoder)
     {
+        if (IsFinished)
+        {
+            // Keep the masking key position in step even though the bytes are dropped
+            Span<byte> scratch = stackalloc byte[256];
+            while (!masked.IsEmpty)
+            {
+                var chunk = masked[..Math.Min(masked.Length, scratch.Length)];
+                encoder.MaskUnmask(scratch[..chunk.Length]);
+                masked = masked[chunk.Length..];
+            }
+            return;
+        }
+
         var destination = _input.GetAppendSpan(masked.Length);
         masked.CopyTo(destination);
         encoder.MaskUnmask(destination);
@@ -318,17 +348,33 @@ internal sealed class PerMessageInflater : IDisposable
     /// <summary>
     /// Signals the end of the compressed message by appending the removed 00 00 FF FF marker.
     /// </summary>
-    public void EndMessage() => _input.Append(FlushMarker);
+    public void EndMessage() => Push(FlushMarker);
 
     /// <summary>
     /// Decompresses into <paramref name="destination"/>. Returns 0 when all pushed input has been consumed.
     /// </summary>
     public int Inflate(Span<byte> destination)
     {
+        if (IsFinished || destination.IsEmpty)
+        {
+            return 0;
+        }
+
         _inflate ??= new DeflateStream(_input, CompressionMode.Decompress, leaveOpen: true);
         try
         {
-            return _inflate.Read(destination);
+            var readsBefore = _input.Reads;
+            var written = _inflate.Read(destination);
+
+            // A DeflateStream that needs input always asks the underlying stream for more; one that has
+            // reached the end of a BFINAL block returns 0 without reading.
+            if (written == 0 && _input.Reads == readsBefore)
+            {
+                IsFinished = true;
+                _input.Clear();
+            }
+
+            return written;
         }
         catch (InvalidDataException ex)
         {
@@ -341,11 +387,12 @@ internal sealed class PerMessageInflater : IDisposable
     /// </summary>
     public void Reset()
     {
-        if (_noContextTakeover && _inflate != null)
+        if ((_noContextTakeover || IsFinished) && _inflate != null)
         {
             _inflate.Dispose();
             _inflate = null;
         }
+        IsFinished = false;
         _input.Clear();
     }
 
@@ -363,6 +410,10 @@ internal sealed class PerMessageInflater : IDisposable
         private byte[] _buffer = new byte[4096];
         private int _start;
         private int _end;
+
+        public int Reads { get; private set; }
+
+        public int Available => _end - _start;
 
         public void Append(ReadOnlySpan<byte> data)
         {
@@ -405,6 +456,7 @@ internal sealed class PerMessageInflater : IDisposable
 
         public override int Read(Span<byte> buffer)
         {
+            Reads++;
             var count = Math.Min(buffer.Length, _end - _start);
             _buffer.AsSpan(_start, count).CopyTo(buffer);
             _start += count;

@@ -185,6 +185,13 @@ public sealed class WebSocketServerProtocol
         }
 
         var subProtocols = WebSocketHandshake.ParseTokenList(head[WebSocketHandshake.HeaderProtocol]);
+        foreach (var protocol in subProtocols)
+        {
+            if (!WebSocketHandshake.IsToken(protocol))
+            {
+                throw new WebSocketHandshakeException(400, $"'{protocol}' is not a valid subprotocol token.");
+            }
+        }
         return new WebSocketUpgradeRequest(head, key, subProtocols, extensions);
     }
 

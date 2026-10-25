@@ -45,6 +45,7 @@ public sealed class WebSocketSession : IAsyncDisposable
     private volatile bool _aborted;
     private bool _outputCompleted;
     private bool _disposed;
+    private int _disposeStarted;
     private WebSocketCloseStatus? _closeStatus;
     private string _closeStatusDescription;
 
@@ -63,6 +64,13 @@ public sealed class WebSocketSession : IAsyncDisposable
     private int _inflatedOffset;
     private int _inflatedCount;
     private bool _inflatedEndsMessage;
+    private bool _inflateInputComplete;
+    private bool _inflaterMayHaveMore;
+    private long _compressedLength;
+
+    // Decompression works in bounded steps so a small compressed frame cannot force a large allocation
+    private const int InflateBufferSize = 64 * 1024;
+    private const int InflateInputChunk = 64 * 1024;
 
     // Send state (guarded by _writeLock)
     private bool _sendInMessage;
@@ -225,6 +233,20 @@ public sealed class WebSocketSession : IAsyncDisposable
             return ServeInflated(buffer.Span);
         }
 
+        if (_inflaterMayHaveMore)
+        {
+            var drained = DrainInflater();
+            if (drained.Kind == StepKind.Error)
+            {
+                await FailAsync(drained.ErrorStatus, drained.ErrorMessage).ConfigureAwait(false);
+            }
+
+            if (_inflatedCount > 0 || _inflatedEndsMessage)
+            {
+                return ServeInflated(buffer.Span);
+            }
+        }
+
         while (true)
         {
             ReadResult result;
@@ -368,12 +390,27 @@ public sealed class WebSocketSession : IAsyncDisposable
                     _messageType = header.Opcode == WebSocketOpcode.Text ? WebSocketMessageType.Text : WebSocketMessageType.Binary;
                     _messageCompressed = header.Rsv1;
                     _messageLength = 0;
+                    _compressedLength = 0;
+                    _inflateInputComplete = false;
                     _utf8.Reset();
                 }
 
-                if (!_messageCompressed && _maxMessageSize is long max && (ulong)_messageLength + header.PayloadLength > (ulong)max)
+                if (_maxMessageSize is long max)
                 {
-                    return Step.Error(WebSocketCloseStatus.MessageTooBig, $"The message exceeds the maximum allowed size of {max} bytes.");
+                    if (!_messageCompressed && (ulong)_messageLength + header.PayloadLength > (ulong)max)
+                    {
+                        return Step.Error(WebSocketCloseStatus.MessageTooBig, $"The message exceeds the maximum allowed size of {max} bytes.");
+                    }
+
+                    // Bound the compressed size too (with headroom for deflate's worst-case expansion of incompressible data)
+                    if (_messageCompressed)
+                    {
+                        _compressedLength = checked(_compressedLength + (long)Math.Min(header.PayloadLength, long.MaxValue / 2));
+                        if (_compressedLength > max + max / 16 + 1024)
+                        {
+                            return Step.Error(WebSocketCloseStatus.MessageTooBig, $"The compressed message exceeds the maximum allowed size of {max} bytes.");
+                        }
+                    }
                 }
 
                 _inFrame = true;
@@ -396,7 +433,8 @@ public sealed class WebSocketSession : IAsyncDisposable
                         return Step.NeedMore;
                     }
 
-                    var take = (long)Math.Min(_frameRemaining, (ulong)remaining.Length);
+                    // Feed at most one chunk before draining, so buffered compressed input stays bounded
+                    var take = (long)Math.Min(Math.Min(_frameRemaining, (ulong)remaining.Length), InflateInputChunk);
                     foreach (var segment in remaining.Slice(0, take))
                     {
                         if (_frameHeader.Masked)
@@ -414,18 +452,17 @@ public sealed class WebSocketSession : IAsyncDisposable
                     consumed = remaining.Start;
                 }
 
-                var endOfInput = false;
                 if (_frameRemaining == 0)
                 {
                     _inFrame = false;
                     if (fin)
                     {
                         _inflater.EndMessage();
-                        endOfInput = true;
+                        _inflateInputComplete = true;
                     }
                 }
 
-                var drainError = DrainInflater(endOfInput);
+                var drainError = DrainInflater();
                 if (drainError.Kind == StepKind.Error)
                 {
                     return drainError;
@@ -437,7 +474,7 @@ public sealed class WebSocketSession : IAsyncDisposable
                     return Step.Inflated;
                 }
 
-                if (_inFrame)
+                if (_inFrame && remaining.IsEmpty)
                 {
                     return Step.NeedMore;
                 }
@@ -559,31 +596,31 @@ public sealed class WebSocketSession : IAsyncDisposable
         return null;
     }
 
-    private Step DrainInflater(bool endOfInput)
+    /// <summary>
+    /// Decompresses buffered input into the fixed-size output buffer. Stops when the buffer is full (more output may
+    /// remain, see <see cref="_inflaterMayHaveMore"/>) or when all buffered input has been consumed.
+    /// </summary>
+    private Step DrainInflater()
     {
-        _inflated ??= new byte[16 * 1024];
+        _inflated ??= new byte[InflateBufferSize];
+        if (_inflatedCount == 0)
+        {
+            _inflatedOffset = 0;
+        }
 
+        var exhausted = false;
         while (true)
         {
-            // Compact or grow so there is always room to inflate into
-            if (_inflatedCount == 0)
+            if (_inflatedOffset + _inflatedCount == _inflated.Length)
             {
+                if (_inflatedOffset == 0)
+                {
+                    // Full: let the reader take some before decompressing more
+                    break;
+                }
+
+                Buffer.BlockCopy(_inflated, _inflatedOffset, _inflated, 0, _inflatedCount);
                 _inflatedOffset = 0;
-            }
-
-            var free = _inflated.Length - (_inflatedOffset + _inflatedCount);
-            if (free < 4096)
-            {
-                if (_inflatedOffset > 0)
-                {
-                    Buffer.BlockCopy(_inflated, _inflatedOffset, _inflated, 0, _inflatedCount);
-                    _inflatedOffset = 0;
-                }
-
-                if (_inflated.Length - _inflatedCount < 4096)
-                {
-                    Array.Resize(ref _inflated, _inflated.Length * 2);
-                }
             }
 
             var target = _inflated.AsSpan(_inflatedOffset + _inflatedCount);
@@ -600,6 +637,7 @@ public sealed class WebSocketSession : IAsyncDisposable
 
             if (written == 0)
             {
+                exhausted = true;
                 break;
             }
 
@@ -617,13 +655,16 @@ public sealed class WebSocketSession : IAsyncDisposable
             _inflatedCount += written;
         }
 
-        if (endOfInput)
+        _inflaterMayHaveMore = !exhausted;
+
+        if (exhausted && _inflateInputComplete)
         {
             if (_messageType == WebSocketMessageType.Text && !_utf8.TryValidate(ReadOnlySpan<byte>.Empty, endOfMessage: true))
             {
                 return Step.Error(WebSocketCloseStatus.InvalidPayloadData, "The text message is not valid UTF-8.");
             }
 
+            _inflateInputComplete = false;
             _inflatedEndsMessage = true;
             _inflater.Reset();
         }
@@ -666,7 +707,8 @@ public sealed class WebSocketSession : IAsyncDisposable
                 {
                     try
                     {
-                        await SendControlFrameAsync(WebSocketOpcode.Pong, payload, CancellationToken.None).ConfigureAwait(false);
+                        // A peer that never reads must not be able to wedge the read loop on our Pong
+                        await SendWithTimeoutAsync(token => SendControlFrameAsync(WebSocketOpcode.Pong, payload, token), _options.CloseTimeout).ConfigureAwait(false);
                     }
                     catch (WebSocketException) when (_closeSent)
                     {
@@ -723,7 +765,7 @@ public sealed class WebSocketSession : IAsyncDisposable
             // RFC 6455 5.5.1: respond with a Close frame, echoing the status code
             try
             {
-                await SendCloseFrameAsync(status, null, CancellationToken.None).ConfigureAwait(false);
+                await SendWithTimeoutAsync(token => SendCloseFrameAsync(status, null, token), _options.CloseTimeout).ConfigureAwait(false);
             }
             catch (Exception) when (_closeSent || _aborted)
             {
@@ -969,7 +1011,25 @@ public sealed class WebSocketSession : IAsyncDisposable
             return;
         }
 
-        await CloseOutputAsync(closeStatus, statusDescription, cancellationToken).ConfigureAwait(false);
+        using (var sendTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _abortCts.Token))
+        {
+            sendTimeout.CancelAfter(_options.CloseTimeout);
+            try
+            {
+                await CloseOutputAsync(closeStatus, statusDescription, sendTimeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Could not even send the Close frame in time (the peer is not reading)
+                Abort();
+                return;
+            }
+            catch (WebSocketException) when (_aborted)
+            {
+                // The session was aborted meanwhile (keep-alive timeout, transport failure); closing is moot
+                return;
+            }
+        }
 
         if (_closeReceived)
         {
@@ -1051,9 +1111,39 @@ public sealed class WebSocketSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Runs an internal send, aborting the session if it cannot complete within <paramref name="timeout"/>
+    /// (for example because the peer stopped reading and a send is stuck on back-pressure).
+    /// </summary>
+    /// <returns>False if the send timed out or the session was aborted.</returns>
+    private async ValueTask<bool> SendWithTimeoutAsync(Func<CancellationToken, ValueTask> send, TimeSpan timeout)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_abortCts.Token);
+        if (timeout > TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
+        {
+            cts.CancelAfter(timeout);
+        }
+
+        try
+        {
+            await send(cts.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            Abort();
+            return false;
+        }
+    }
+
     private async ValueTask CompleteOutputAsync()
     {
-        await _writeLock.WaitAsync().ConfigureAwait(false);
+        // If a send is stuck on back-pressure, give up after the close timeout; aborting cancels the stuck flush and frees the lock
+        if (!await _writeLock.WaitAsync(_options.CloseTimeout).ConfigureAwait(false))
+        {
+            Abort();
+            await _writeLock.WaitAsync().ConfigureAwait(false);
+        }
         try
         {
             if (!_outputCompleted)
@@ -1091,7 +1181,7 @@ public sealed class WebSocketSession : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeStarted, 1) == 1)
         {
             return;
         }
@@ -1114,7 +1204,12 @@ public sealed class WebSocketSession : IAsyncDisposable
 
         await CompleteOutputAsync().ConfigureAwait(false);
 
-        // Only complete the input if no read is running; a running read will fail on the cancelled read instead
+        // A running read observes the abort (cancelled read) and returns; give it a moment before completing the input
+        for (var i = 0; i < 100 && Volatile.Read(ref _readInProgress) == 1; i++)
+        {
+            await Task.Delay(10).ConfigureAwait(false);
+        }
+
         if (Volatile.Read(ref _readInProgress) == 0)
         {
             await _input.CompleteAsync().ConfigureAwait(false);
@@ -1122,7 +1217,6 @@ public sealed class WebSocketSession : IAsyncDisposable
 
         _deflater?.Dispose();
         _inflater?.Dispose();
-        _abortCts.Dispose();
 
         if (_owner != null)
         {
@@ -1156,7 +1250,11 @@ public sealed class WebSocketSession : IAsyncDisposable
 
                 var sentAt = Environment.TickCount64;
                 BinaryPrimitives.WriteInt64BigEndian(payload, ++counter);
-                await PingAsync(payload, token).ConfigureAwait(false);
+                // Bound the send by the keep-alive timeout, so a peer that stops reading is detected too
+                if (!await SendWithTimeoutAsync(t => PingAsync(payload, t), timeout).ConfigureAwait(false))
+                {
+                    return;
+                }
 
                 if (timeout > TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
                 {

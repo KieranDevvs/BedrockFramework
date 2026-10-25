@@ -227,7 +227,7 @@ internal sealed class HttpHead
         var startLine = lines[0];
         var firstSpace = startLine.IndexOf(' ');
         var secondSpace = firstSpace < 0 ? -1 : startLine.IndexOf(' ', firstSpace + 1);
-        if (firstSpace <= 0 || (isRequest && secondSpace < 0))
+        if (firstSpace <= 0 || (isRequest && secondSpace < 0) || ContainsControlCharacters(startLine))
         {
             throw Malformed(isRequest, "Malformed HTTP start line.");
         }
@@ -271,6 +271,11 @@ internal sealed class HttpHead
             }
 
             var value = line[(colon + 1)..].Trim(' ', '\t');
+            if (ContainsControlCharacters(value))
+            {
+                // Bare CR, LF, NUL and other controls must never reach a response (RFC 7230 3.2)
+                throw Malformed(isRequest, $"The value of header '{name}' contains control characters.");
+            }
             result.Headers[name] = result.Headers.TryGetValue(name, out var existing) ? StringValues.Concat(existing, value) : new StringValues(value);
         }
 
@@ -278,4 +283,16 @@ internal sealed class HttpHead
     }
 
     private static WebSocketHandshakeException Malformed(bool isRequest, string message) => new(isRequest ? 400 : null, message);
+
+    internal static bool ContainsControlCharacters(string value)
+    {
+        foreach (var c in value)
+        {
+            if ((c < 0x20 && c != '\t') || c == 0x7F)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 }

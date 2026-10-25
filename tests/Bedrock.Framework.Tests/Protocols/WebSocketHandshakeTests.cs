@@ -114,6 +114,9 @@ public class WebSocketHandshakeTests
         { "GET /chat HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n", 426, "Sec-WebSocket-Version: 13" },
         { "GET /chat HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: https://evil.example\r\n\r\n", 403, null },
         { "GET /chat HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n", 400, null },
+        { "GET /chat HTTP/1.1\r\nHost: a\r\nX-Evil: a\nInjected: b\r\n\r\n", 400, null },
+        { "GET /chat HTTP/1.1\r\nHost: a\r\nX-Nul: a\0b\r\n\r\n", 400, null },
+        { "GET /chat HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat, bad/token\r\n\r\n", 400, null },
         { "GET /chat HTTP/1.1\r\nHost: a\r\nX-Big: " + new string('a', 20000) + "\r\n\r\n", 431, null },
     };
 
