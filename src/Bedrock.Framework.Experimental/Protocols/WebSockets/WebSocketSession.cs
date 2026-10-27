@@ -791,12 +791,14 @@ public sealed class WebSocketSession : IAsyncDisposable
         _closeStatus = status;
         _closeStatusDescription = message;
 
+        var closeSent = false;
         if (!_closeSent && !_aborted)
         {
             try
             {
                 using var timeout = new CancellationTokenSource(_options.CloseTimeout);
                 await SendCloseFrameAsync(status, null, timeout.Token).ConfigureAwait(false);
+                closeSent = true;
             }
             catch
             {
@@ -804,7 +806,27 @@ public sealed class WebSocketSession : IAsyncDisposable
             }
         }
 
-        Abort();
+        if (closeSent)
+        {
+            // Aborting the connection straight away can discard the Close frame before it is transmitted, and closing
+            // a socket with unread input resets it. So half-close our side and briefly drain the peer's input
+            // ("lingering close") so the peer actually receives the status code (RFC 6455 7.1.7).
+            try
+            {
+                await CompleteOutputAsync().ConfigureAwait(false);
+                await DrainInputAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+
+            AbortCore(abortConnection: false);
+        }
+        else
+        {
+            Abort();
+        }
+
         throw new WebSocketException(WebSocketError.Faulted, $"The WebSocket connection was failed with status {(int)status} ({status}): {message}");
     }
 
@@ -1161,7 +1183,9 @@ public sealed class WebSocketSession : IAsyncDisposable
     /// <summary>
     /// Immediately aborts the session without a close handshake. Pending reads and writes fail.
     /// </summary>
-    public void Abort()
+    public void Abort() => AbortCore(abortConnection: true);
+
+    private void AbortCore(bool abortConnection)
     {
         if (_aborted || State == WebSocketState.Closed)
         {
@@ -1172,8 +1196,39 @@ public sealed class WebSocketSession : IAsyncDisposable
         _abortCts.Cancel();
         _input.CancelPendingRead();
         _output.CancelPendingFlush();
-        Connection?.Abort(new ConnectionAbortedException("The WebSocket session was aborted."));
+        if (abortConnection)
+        {
+            Connection?.Abort(new ConnectionAbortedException("The WebSocket session was aborted."));
+        }
         _closeReceivedTcs.TrySetResult();
+    }
+
+    /// <summary>
+    /// Reads and discards input until the peer closes the transport, no more input arrives for a short while, or the
+    /// timeout elapses. Only called by the reader.
+    /// </summary>
+    private async ValueTask DrainInputAsync(TimeSpan timeout)
+    {
+        using var overall = new CancellationTokenSource(timeout);
+        try
+        {
+            while (true)
+            {
+                using var idle = CancellationTokenSource.CreateLinkedTokenSource(overall.Token);
+                idle.CancelAfter(TimeSpan.FromMilliseconds(250));
+
+                var result = await _input.ReadAsync(idle.Token).ConfigureAwait(false);
+                _input.AdvanceTo(result.Buffer.End);
+                if (result.IsCompleted || result.IsCanceled)
+                {
+                    return;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // Quiet, timed out or the transport failed; either way we are done
+        }
     }
 
     /// <summary>
