@@ -435,6 +435,62 @@ public class WebSocketEndToEndTests
         return (result.MessageType, stream.ToArray());
     }
 
+    [Fact]
+    public async Task KestrelWebSocketTransportListensOnPlainWsWithAnIpAddress()
+    {
+        // ListenWebSocket parses the host as an IP address and only uses TLS for wss:// (it once ignored the parsed
+        // address and always required TLS)
+        var serviceProvider = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var server = new ServerBuilder(serviceProvider)
+            .ListenWebSocket(new Uri("ws://127.0.0.1:0/transport"), builder => builder.Run(async connection =>
+            {
+                while (true)
+                {
+                    var result = await connection.Transport.Input.ReadAsync();
+                    foreach (var segment in result.Buffer)
+                    {
+                        await connection.Transport.Output.WriteAsync(segment);
+                    }
+                    connection.Transport.Input.AdvanceTo(result.Buffer.End);
+                    if (result.IsCompleted)
+                    {
+                        return;
+                    }
+                }
+            }))
+            .Build();
+
+        await server.StartAsync();
+        try
+        {
+            var endpoint = (IPEndPoint)server.EndPoints.Single();
+            Assert.Equal(IPAddress.Loopback, endpoint.Address);
+            Assert.NotEqual(0, endpoint.Port);
+
+            using var client = new ClientWebSocket();
+            await client.ConnectAsync(new Uri($"ws://127.0.0.1:{endpoint.Port}/transport"), default).WaitAsync(Timeout);
+
+            var payload = Encoding.UTF8.GetBytes("over the Kestrel WebSocket transport");
+            await client.SendAsync(payload, WebSocketMessageType.Binary, true, default).WaitAsync(Timeout);
+
+            var received = new MemoryStream();
+            var buffer = new byte[1024];
+            while (received.Length < payload.Length)
+            {
+                var result = await client.ReceiveAsync(buffer, default).WaitAsync(Timeout);
+                Assert.NotEqual(WebSocketMessageType.Close, result.MessageType);
+                received.Write(buffer, 0, result.Count);
+            }
+            Assert.Equal(payload, received.ToArray());
+
+            await client.CloseAsync(WebSocketCloseStatus.NormalClosure, null, default).WaitAsync(Timeout);
+        }
+        finally
+        {
+            await server.StopAsync();
+        }
+    }
+
     private static X509Certificate2 CreateCertificate()
     {
         using var key = RSA.Create(2048);

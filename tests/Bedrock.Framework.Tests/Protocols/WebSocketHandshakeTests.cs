@@ -118,6 +118,12 @@ public class WebSocketHandshakeTests
         { "GET /chat HTTP/1.1\r\nHost: a\r\nX-Nul: a\0b\r\n\r\n", 400, null },
         { "GET /chat HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat, bad/token\r\n\r\n", 400, null },
         { "GET /chat HTTP/1.1\r\nHost: a\r\nX-Big: " + new string('a', 20000) + "\r\n\r\n", 431, null },
+        // Headers that never end must be rejected once they pass the limit, not buffered without bound
+        { "GET /chat HTTP/1.1\r\nHost: a\r\nX-Big: " + new string('a', 20000), 431, null },
+        { "GET\r\nHost: a\r\n\r\n", 400, null },
+        { "GET /chat\r\nHost: a\r\n\r\n", 400, null },
+        { "GET /chat HTTP/1.1\r\nHost a\r\n\r\n", 400, null },
+        { "GET /chat HTTP/1.1\r\nBad Name: a\r\n\r\n", 400, null },
     };
 
     [Theory]
@@ -220,6 +226,11 @@ public class WebSocketHandshakeTests
         { "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Extensions: x-unknown\r\n\r\n", "x-unknown" },
         { "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits=10\r\n\r\n", "client_max_window_bits" },
         { "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Extensions: permessage-deflate, permessage-deflate\r\n\r\n", "not offered" },
+        // RFC 6455 4.1: the server may select at most one of the offered subprotocols
+        { "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: chat, chat\r\n\r\n", "more than one subprotocol" },
+        { "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Extensions: permessage-deflate; =x\r\n\r\n", "Expected a token" },
+        { "garbage\r\n\r\n", "start line" },
+        { "HTTP/1.1 abc OK\r\n\r\n", "malformed" },
     };
 
     [Theory]
@@ -238,6 +249,77 @@ public class WebSocketHandshakeTests
 
         var ex = await Assert.ThrowsAsync<WebSocketHandshakeException>(() => connect.WaitAsync(Timeout));
         Assert.Contains(expectedMessageFragment, ex.Message);
+    }
+
+    [Fact]
+    public async Task ConnectionClosedPartWayThroughTheRequestFailsTheHandshake()
+    {
+        var (connection, peer) = CreateConnection();
+        await peer.Output.WriteAsync(Encoding.ASCII.GetBytes("GET /chat HTTP/1.1\r\nHost: exa"));
+        await peer.Output.CompleteAsync();
+
+        var ex = await Assert.ThrowsAsync<WebSocketHandshakeException>(() => new WebSocketServerProtocol(connection).ReadRequestAsync().AsTask().WaitAsync(Timeout));
+        Assert.Null(ex.StatusCode);
+        Assert.Contains("closed before the handshake completed", ex.Message);
+    }
+
+    [Fact]
+    public async Task ConnectionClosedBeforeAnyRequestFailsTheHandshake()
+    {
+        var (connection, peer) = CreateConnection();
+        await peer.Output.CompleteAsync();
+
+        var ex = await Assert.ThrowsAsync<WebSocketHandshakeException>(() => new WebSocketServerProtocol(connection).ReadRequestAsync().AsTask().WaitAsync(Timeout));
+        Assert.Null(ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task ServerClosingDuringTheResponseFailsTheClientHandshake()
+    {
+        var (connection, peer) = CreateConnection();
+        var connect = WebSocketClientProtocol.ConnectAsync(connection, new Uri("ws://example.com/chat")).AsTask();
+
+        await ReadResponseAsync(peer.Input);
+        await peer.Output.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 101 Switching Protocols\r\nUpg"));
+        await peer.Output.CompleteAsync();
+
+        await Assert.ThrowsAsync<WebSocketHandshakeException>(() => connect.WaitAsync(Timeout));
+    }
+
+    [Theory]
+    // RFC 8441 4: the extended CONNECT method with :protocol = websocket
+    [InlineData("GET", "websocket", "13", 405, "Allow", "CONNECT")]
+    [InlineData("CONNECT", "chat", "13", 400, null, null)]
+    // RFC 8441 5: Sec-WebSocket-Version is still required; the error advertises the supported version
+    [InlineData("CONNECT", "websocket", "8", 400, "Sec-WebSocket-Version", "13")]
+    public async Task InvalidExtendedConnectRequestsAreRejected(string method, string protocol, string version, int status, string header, string headerValue)
+    {
+        var (connection, _) = CreateConnection();
+        var feature = new FakeUpgradeFeature(method, protocol, version);
+        connection.Features.Set<IWebSocketUpgradeFeature>(feature);
+
+        var ex = await Assert.ThrowsAsync<WebSocketHandshakeException>(() => new WebSocketServerProtocol(connection).ReadRequestAsync().AsTask().WaitAsync(Timeout));
+        Assert.Equal(status, ex.StatusCode);
+        Assert.Equal(status, feature.RejectedWith);
+        if (header != null)
+        {
+            Assert.Equal(headerValue, feature.RejectionHeaders[header]);
+        }
+    }
+
+    [Fact]
+    public async Task ValidExtendedConnectRequestIsAcceptedThroughTheFeature()
+    {
+        var (connection, _) = CreateConnection();
+        var feature = new FakeUpgradeFeature("CONNECT", "websocket", "13", extensions: "permessage-deflate");
+        connection.Features.Set<IWebSocketUpgradeFeature>(feature);
+
+        var options = new WebSocketServerOptions { KeepAliveInterval = TimeSpan.Zero, Compression = new WebSocketCompressionOptions() };
+        await using var session = await WebSocketServerProtocol.UpgradeAsync(connection, options).AsTask().WaitAsync(Timeout);
+
+        Assert.NotNull(session.Compression);
+        Assert.Equal("permessage-deflate", feature.AcceptedHeaders["Sec-WebSocket-Extensions"]);
+        Assert.False(feature.AcceptedHeaders.ContainsKey("Sec-WebSocket-Accept"));
     }
 
     [Theory]
@@ -304,6 +386,50 @@ public class WebSocketHandshakeTests
         var options = new PipeOptions(useSynchronizationContext: false);
         var pair = DuplexPipe.CreateConnectionPair(options, options);
         return (new TestConnectionContext(pair.Transport), pair.Application);
+    }
+
+    private sealed class FakeUpgradeFeature : IWebSocketUpgradeFeature
+    {
+        public FakeUpgradeFeature(string method, string protocol, string version, string extensions = null)
+        {
+            Method = method;
+            Protocol = protocol;
+            var headers = new Dictionary<string, Microsoft.Extensions.Primitives.StringValues>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Host"] = "example.com",
+                ["Sec-WebSocket-Version"] = version,
+            };
+            if (extensions != null)
+            {
+                headers["Sec-WebSocket-Extensions"] = extensions;
+            }
+            Headers = headers;
+        }
+
+        public bool IsExtendedConnect => true;
+        public string Method { get; }
+        public string RequestTarget => "/chat";
+        public string HttpVersion => "HTTP/2";
+        public string Protocol { get; }
+        public IReadOnlyDictionary<string, Microsoft.Extensions.Primitives.StringValues> Headers { get; }
+
+        public int? RejectedWith { get; private set; }
+        public IReadOnlyDictionary<string, string> RejectionHeaders { get; private set; }
+        public IReadOnlyDictionary<string, string> AcceptedHeaders { get; private set; }
+
+        public ValueTask<IDuplexPipe> AcceptAsync(IReadOnlyDictionary<string, string> responseHeaders, CancellationToken cancellationToken)
+        {
+            AcceptedHeaders = responseHeaders;
+            var options = new PipeOptions(useSynchronizationContext: false);
+            return new ValueTask<IDuplexPipe>(DuplexPipe.CreateConnectionPair(options, options).Transport);
+        }
+
+        public ValueTask RejectAsync(int statusCode, IReadOnlyDictionary<string, string> responseHeaders, CancellationToken cancellationToken)
+        {
+            RejectedWith = statusCode;
+            RejectionHeaders = responseHeaders;
+            return default;
+        }
     }
 
     private sealed class TestConnectionContext : ConnectionContext

@@ -568,6 +568,169 @@ public class WebSocketSessionTests
         await Assert.ThrowsAnyAsync<Exception>(() => send.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(1000)]
+    [InlineData(7777)]
+    [InlineData(65537)]
+    public async Task CompressedMessagesSurviveReadsOfAnySize(int readSize)
+    {
+        // Partial reads leave decompressed bytes behind in the session's buffer; they must be kept in order
+        var (ours, peerStream) = CreatePair();
+        await using var server = WebSocketSession.Create(ours, isServer: true, NoKeepAlive(), compression: new PerMessageDeflateParameters());
+        using var client = WebSocket.CreateFromStream(peerStream, BclOptions(isServer: false, compress: true));
+
+        var payload = new byte[readSize == 1 ? 50_000 : 400_000];
+        var random = new Random(readSize);
+        for (var i = 0; i < payload.Length; i++)
+        {
+            // Compressible but not trivially so: runs of random lengths and values
+            payload[i] = (byte)(i % 300 < 150 ? random.Next(4) : i / 1000);
+        }
+
+        for (var message = 0; message < 2; message++)
+        {
+            var send = client.SendAsync(payload, WebSocketMessageType.Binary, true, default);
+            var received = new MemoryStream();
+            var buffer = new byte[readSize];
+            WebSocketReadResult result;
+            do
+            {
+                result = await server.ReadAsync(buffer).AsTask().WaitAsync(Timeout);
+                received.Write(buffer, 0, result.Count);
+            }
+            while (!result.EndOfMessage);
+
+            await send.WaitAsync(Timeout);
+            Assert.Equal(payload, received.ToArray());
+        }
+    }
+
+    [Fact]
+    public async Task MaskedFrameFromServerFailsTheConnection()
+    {
+        // RFC 6455 5.1: a client must close the connection if it receives a masked frame
+        var (ours, peer) = CreateRawPair();
+        await using var client = WebSocketSession.Create(ours, isServer: false, NoKeepAlive());
+
+        await WriteRawFrameAsync(peer.Output, WebSocketOpcode.Text, fin: true, "hi"u8.ToArray(), masked: true);
+
+        await Assert.ThrowsAsync<WebSocketException>(() => client.ReadMessageAsync().AsTask().WaitAsync(Timeout));
+        Assert.Equal(WebSocketCloseStatus.ProtocolError, client.CloseStatus);
+
+        var close = await ReadRawFrameAsync(peer.Input);
+        Assert.Equal(WebSocketOpcode.Close, close.Header.Opcode);
+        Assert.True(close.Header.Masked);
+        Assert.Equal(1002, BinaryPrimitives.ReadUInt16BigEndian(close.Payload));
+    }
+
+    public static TheoryData<string, byte[][], WebSocketCloseStatus> CompressedProtocolViolations() => new()
+    {
+        // RFC 7692 6: RSV1 marks the first frame of a compressed message only
+        { "rsv1 on a continuation frame", [Frame(0x41, DeflateFinal("ab"u8.ToArray())), Frame(0xC0, DeflateFinal("cd"u8.ToArray()))], WebSocketCloseStatus.ProtocolError },
+        { "rsv1 on a control frame", [Frame(0xC9, "")], WebSocketCloseStatus.ProtocolError },
+        // RFC 6455 8.1: text must be valid UTF-8 after decompression
+        { "invalid utf8 in compressed text", [Frame(0xC1, DeflateFinal([0x61, 0xFF, 0xFE]))], WebSocketCloseStatus.InvalidPayloadData },
+        { "truncated utf8 at end of compressed text", [Frame(0xC1, DeflateFinal([0x6F, 0x6B, 0xE2, 0x82]))], WebSocketCloseStatus.InvalidPayloadData },
+        // RFC 7692 8: data that cannot be decompressed fails the connection (BTYPE 11 is reserved)
+        { "corrupt deflate data", [Frame(0xC2, new byte[] { 0xFF, 0xFF, 0xFF, 0xFF })], WebSocketCloseStatus.InvalidPayloadData },
+    };
+
+    [Theory]
+    [MemberData(nameof(CompressedProtocolViolations))]
+    public async Task CompressedProtocolViolationsFailTheConnection(string name, byte[][] frames, WebSocketCloseStatus expected)
+    {
+        _ = name;
+        var (ours, peer) = CreateRawPair();
+        await using var server = WebSocketSession.Create(ours, isServer: true, NoKeepAlive(), compression: new PerMessageDeflateParameters());
+
+        foreach (var frame in frames)
+        {
+            await WriteRawFrameAsync(peer.Output, (WebSocketOpcode)(frame[0] & 0x0F), (frame[0] & 0x80) != 0, frame[1..], rsvBits: (byte)(frame[0] & 0x70));
+        }
+
+        var ex = await Assert.ThrowsAsync<WebSocketException>(() => server.ReadMessageAsync().AsTask().WaitAsync(Timeout));
+        Assert.Equal(WebSocketError.Faulted, ex.WebSocketErrorCode);
+        Assert.Equal(expected, server.CloseStatus);
+
+        var close = await ReadRawFrameAsync(peer.Input);
+        Assert.Equal(WebSocketOpcode.Close, close.Header.Opcode);
+        Assert.Equal((int)expected, BinaryPrimitives.ReadUInt16BigEndian(close.Payload));
+    }
+
+    [Fact]
+    public async Task TransportFailureWhileReadingAbortsTheSession()
+    {
+        var (ours, peer) = CreateRawPair();
+        await using var server = WebSocketSession.Create(ours, isServer: true, NoKeepAlive());
+
+        await peer.Output.CompleteAsync(new IOException("Connection reset"));
+
+        var ex = await Assert.ThrowsAsync<WebSocketException>(() => server.ReadMessageAsync().AsTask().WaitAsync(Timeout));
+        Assert.Equal(WebSocketError.ConnectionClosedPrematurely, ex.WebSocketErrorCode);
+        Assert.IsType<IOException>(ex.InnerException);
+        Assert.Equal(WebSocketState.Aborted, server.State);
+    }
+
+    [Fact]
+    public async Task TransportFailureWhileWritingAbortsTheSession()
+    {
+        var (ours, peer) = CreateRawPair();
+        await using var server = WebSocketSession.Create(ours, isServer: true, NoKeepAlive());
+
+        await peer.Input.CompleteAsync(new IOException("Broken pipe"));
+
+        var ex = await Assert.ThrowsAsync<WebSocketException>(() => server.SendTextAsync("hello").AsTask().WaitAsync(Timeout));
+        Assert.Equal(WebSocketError.ConnectionClosedPrematurely, ex.WebSocketErrorCode);
+        Assert.Equal(WebSocketState.Aborted, server.State);
+        await Assert.ThrowsAnyAsync<Exception>(() => server.SendTextAsync("again").AsTask().WaitAsync(Timeout));
+    }
+
+    [Fact]
+    public async Task ControlFramePayloadLimitsAreEnforcedWhenSending()
+    {
+        // RFC 6455 5.5: control frame payloads are at most 125 bytes, so a close reason is at most 123
+        var (ours, peer) = CreateRawPair();
+        await using var server = WebSocketSession.Create(ours, isServer: true, NoKeepAlive());
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => server.PingAsync(new byte[126]).AsTask());
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => server.PongAsync(new byte[126]).AsTask());
+        await Assert.ThrowsAsync<ArgumentException>(() => server.CloseAsync(WebSocketCloseStatus.NormalClosure, new string('a', 124)).AsTask());
+        await Assert.ThrowsAsync<ArgumentException>(() => server.SendAsync(new byte[1], WebSocketMessageType.Close).AsTask());
+
+        // The limits themselves are allowed, and nothing invalid reached the wire
+        await server.PongAsync(new byte[125]).AsTask().WaitAsync(Timeout);
+        var pong = await ReadRawFrameAsync(peer.Input);
+        Assert.Equal(WebSocketOpcode.Pong, pong.Header.Opcode);
+        Assert.Equal(125, pong.Payload.Length);
+        Assert.Equal(WebSocketState.Open, server.State);
+    }
+
+    [Fact]
+    public async Task DuplexPipeKeepsProcessingTheSessionAfterTheApplicationStopsReading()
+    {
+        var (ours, peerStream) = CreatePair();
+        var session = WebSocketSession.Create(ours, isServer: true, NoKeepAlive());
+        await using var pipe = new WebSocketDuplexPipe(session);
+        using var client = WebSocket.CreateFromStream(peerStream, BclOptions(isServer: false, compress: false));
+
+        await client.SendAsync("first"u8.ToArray(), WebSocketMessageType.Binary, true, default).WaitAsync(Timeout);
+        var read = await pipe.Input.ReadAsync().AsTask().WaitAsync(Timeout);
+        Assert.Equal("first", Encoding.UTF8.GetString(read.Buffer.ToArray()));
+
+        // The application is done reading, but the peer is still sending
+        await pipe.Input.CompleteAsync();
+        for (var i = 0; i < 20; i++)
+        {
+            await client.SendAsync(new byte[10_000], WebSocketMessageType.Binary, true, default).WaitAsync(Timeout);
+        }
+
+        // Pings and the peer's Close must still be answered
+        await client.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", default).WaitAsync(Timeout);
+        Assert.Equal(WebSocketState.Closed, client.State);
+        Assert.Equal(WebSocketState.Closed, session.State);
+    }
+
     private static byte[] DeflateFinal(byte[] data)
     {
         var output = new MemoryStream();
