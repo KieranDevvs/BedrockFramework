@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 using System.IO.Pipelines;
 using System.Linq;
@@ -433,6 +434,202 @@ public class WebSocketEndToEndTests
         while (!result.EndOfMessage);
 
         return (result.MessageType, stream.ToArray());
+    }
+
+    [Fact]
+    public async Task ClientWebSocketTransportRunsBedrockProtocolsAgainstNativeServer()
+    {
+        var serviceProvider = new ServiceCollection().AddLogging().BuildServiceProvider();
+        WebSocketSession serverSession = null;
+
+        var server = new ServerBuilder(serviceProvider)
+            .UseSockets(sockets => sockets.Listen(IPAddress.Loopback, 0, builder => builder
+                .UseWebSocketServer(options =>
+                {
+                    options.KeepAliveInterval = TimeSpan.Zero;
+                    options.Compression = new WebSocketCompressionOptions();
+                })
+                .Run(async connection =>
+                {
+                    serverSession = connection.Features.Get<IWebSocketSessionFeature>().Session;
+                    await connection.Transport.Input.CopyToAsync(connection.Transport.Output);
+                })))
+            .Build();
+
+        await server.StartAsync();
+        try
+        {
+            var port = ((IPEndPoint)server.EndPoints.Single()).Port;
+            var client = new ClientBuilder(serviceProvider)
+                .UseClientWebSocket(options => options.DangerousDeflateOptions = new WebSocketDeflateOptions())
+                .Build();
+
+            await using var connection = await client.ConnectAsync(new UriEndPoint(new Uri($"ws://127.0.0.1:{port}/"))).AsTask().WaitAsync(Timeout);
+            Assert.NotNull(connection.Features.Get<IClientWebSocketFeature>().WebSocket);
+
+            // A Bedrock length-prefixed protocol over the ClientWebSocket transport
+            var reader = connection.CreateReader();
+            var writer = connection.CreateWriter();
+            var protocol = new LengthPrefixedText();
+            foreach (var text in new[] { "one", string.Concat(Enumerable.Repeat("compress me ", 10_000)), "three" })
+            {
+                await writer.WriteAsync(protocol, text).AsTask().WaitAsync(Timeout);
+                var result = await reader.ReadAsync(protocol).AsTask().WaitAsync(Timeout);
+                Assert.Equal(text, result.Message);
+                reader.Advance();
+            }
+
+            // permessage-deflate was negotiated between ClientWebSocket and Bedrock's server
+            Assert.NotNull(serverSession.Compression);
+        }
+        finally
+        {
+            await server.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ClientWebSocketTransportSendsFlushedDataAndClosesWhenOutputCompletes()
+    {
+        var serviceProvider = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var received = new MemoryStream();
+        var messageTypes = new System.Collections.Concurrent.ConcurrentBag<WebSocketMessageType>();
+        var closed = new TaskCompletionSource<WebSocketMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var server = new ServerBuilder(serviceProvider)
+            .UseSockets(sockets => sockets.Listen(IPAddress.Loopback, 0, builder => builder.RunWebSocket(async (session, _) =>
+            {
+                while (true)
+                {
+                    var message = await session.ReadMessageAsync();
+                    if (message.MessageType == WebSocketMessageType.Close)
+                    {
+                        closed.TrySetResult(message);
+                        return;
+                    }
+                    messageTypes.Add(message.MessageType);
+                    received.Write(message.Data.Span);
+                }
+            }, options => options.KeepAliveInterval = TimeSpan.Zero)))
+            .Build();
+
+        await server.StartAsync();
+        try
+        {
+            var port = ((IPEndPoint)server.EndPoints.Single()).Port;
+            var client = new ClientBuilder(serviceProvider).UseClientWebSocket(messageType: WebSocketMessageType.Text).Build();
+            await using var connection = await client.ConnectAsync(new UriEndPoint(new Uri($"ws://127.0.0.1:{port}/"))).AsTask().WaitAsync(Timeout);
+            var output = connection.Transport.Output;
+
+            output.Write("hello "u8);
+            output.Write("world"u8);
+            await output.FlushAsync().AsTask().WaitAsync(Timeout);
+
+            // A flush spanning many pipe segments is sent as one fragmented message
+            var large = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(0, 20_000).Select(i => (char)('a' + i % 26))));
+            for (var offset = 0; offset < large.Length; offset += 1000)
+            {
+                output.Write(large.AsSpan(offset, Math.Min(1000, large.Length - offset)));
+            }
+            await output.FlushAsync().AsTask().WaitAsync(Timeout);
+
+            // Completing the output performs the close handshake with 1000
+            await output.CompleteAsync();
+            var close = await closed.Task.WaitAsync(Timeout);
+            Assert.Equal(WebSocketCloseStatus.NormalClosure, close.CloseStatus);
+
+            // The byte stream arrives intact and in order, using the configured message type
+            Assert.Equal(Encoding.UTF8.GetBytes("hello world").Concat(large).ToArray(), received.ToArray());
+            Assert.All(messageTypes, type => Assert.Equal(WebSocketMessageType.Text, type));
+            Assert.InRange(messageTypes.Count, 1, 2);
+
+            // The server's Close reply completes the input side
+            var read = await connection.Transport.Input.ReadAsync().AsTask().WaitAsync(Timeout);
+            Assert.True(read.IsCompleted);
+        }
+        finally
+        {
+            await server.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ClientWebSocketTransportCompletesInputWhenTheServerCloses()
+    {
+        var serviceProvider = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var server = new ServerBuilder(serviceProvider)
+            .UseSockets(sockets => sockets.Listen(IPAddress.Loopback, 0, builder => builder.RunWebSocket(async (session, _) =>
+            {
+                await session.SendTextAsync("goodbye");
+                await session.CloseAsync(WebSocketCloseStatus.EndpointUnavailable, "shutting down");
+            }, options => options.KeepAliveInterval = TimeSpan.Zero)))
+            .Build();
+
+        await server.StartAsync();
+        try
+        {
+            var port = ((IPEndPoint)server.EndPoints.Single()).Port;
+            var client = new ClientBuilder(serviceProvider).UseClientWebSocket().Build();
+            await using var connection = await client.ConnectAsync(new UriEndPoint(new Uri($"ws://127.0.0.1:{port}/"))).AsTask().WaitAsync(Timeout);
+
+            var data = new MemoryStream();
+            while (true)
+            {
+                var result = await connection.Transport.Input.ReadAsync().AsTask().WaitAsync(Timeout);
+                foreach (var segment in result.Buffer)
+                {
+                    data.Write(segment.Span);
+                }
+                connection.Transport.Input.AdvanceTo(result.Buffer.End);
+                if (result.IsCompleted)
+                {
+                    break;
+                }
+            }
+
+            Assert.Equal("goodbye", Encoding.UTF8.GetString(data.ToArray()));
+            var socket = connection.Features.Get<IClientWebSocketFeature>().WebSocket;
+            Assert.Equal(WebSocketCloseStatus.EndpointUnavailable, socket.CloseStatus);
+            Assert.Equal("shutting down", socket.CloseStatusDescription);
+            Assert.True(connection.ConnectionClosed.WaitHandle.WaitOne(Timeout));
+        }
+        finally
+        {
+            await server.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ClientWebSocketTransportValidatesItsArguments()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ClientWebSocketConnectionFactory(messageType: WebSocketMessageType.Close));
+        await Assert.ThrowsAsync<NotSupportedException>(() => new ClientWebSocketConnectionFactory().ConnectAsync(new IPEndPoint(IPAddress.Loopback, 1)).AsTask());
+    }
+
+    private sealed class LengthPrefixedText : IMessageReader<string>, IMessageWriter<string>
+    {
+        public bool TryParseMessage(in ReadOnlySequence<byte> input, ref SequencePosition consumed, ref SequencePosition examined, out string message)
+        {
+            message = null;
+            var reader = new SequenceReader<byte>(input);
+            if (!reader.TryReadBigEndian(out int length) || reader.Remaining < length)
+            {
+                return false;
+            }
+
+            message = Encoding.UTF8.GetString(input.Slice(reader.Position, length));
+            consumed = examined = input.GetPosition(4 + length);
+            return true;
+        }
+
+        public void WriteMessage(string message, IBufferWriter<byte> output)
+        {
+            var bytes = Encoding.UTF8.GetBytes(message);
+            var header = output.GetSpan(4);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(header, bytes.Length);
+            output.Advance(4);
+            output.Write(bytes);
+        }
     }
 
     [Fact]
