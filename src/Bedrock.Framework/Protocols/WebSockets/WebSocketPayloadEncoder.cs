@@ -13,7 +13,7 @@ namespace Bedrock.Framework.Protocols.WebSockets
     /// Masks or unmasks a WebSocket payload according to the provided masking key, tracking the
     /// masking key index accross mask or unmasking requests.
     /// </summary>
-    internal struct WebSocketPayloadEncoder
+    public struct WebSocketPayloadEncoder
     {
         /// <summary>
         /// The masking key to use to mask or unmask the payload.
