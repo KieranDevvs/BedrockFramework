@@ -8,8 +8,10 @@ namespace Bedrock.Framework.Experimental.Protocols.WebSockets;
 
 /// <summary>
 /// Exposes a <see cref="WebSocketSession"/> as a byte-stream <see cref="IDuplexPipe"/>, so any Bedrock protocol can run
-/// over WebSockets. Incoming message payloads are written to <see cref="Input"/> back to back; each flush of
-/// <see cref="Output"/> is sent as one WebSocket message. Completing <see cref="Output"/> performs the close handshake.
+/// over WebSockets. Incoming message payloads are written to <see cref="Input"/> back to back, and data flushed to
+/// <see cref="Output"/> is sent as WebSocket messages. Message boundaries are not preserved in either direction (flushes
+/// made in quick succession may be sent as one message), so use a self-delimiting protocol such as a length prefix.
+/// Completing <see cref="Output"/> performs the close handshake.
 /// </summary>
 public sealed class WebSocketDuplexPipe : IDuplexPipe, IAsyncDisposable
 {
@@ -48,7 +50,8 @@ public sealed class WebSocketDuplexPipe : IDuplexPipe, IAsyncDisposable
     public PipeReader Input => _incoming.Reader;
 
     /// <summary>
-    /// Each flush is sent as a single message. Complete it to close the session.
+    /// Flushed data is sent as WebSocket messages; buffered data from several flushes may be combined into one.
+    /// Complete it to close the session.
     /// </summary>
     public PipeWriter Output => _outgoing.Writer;
 

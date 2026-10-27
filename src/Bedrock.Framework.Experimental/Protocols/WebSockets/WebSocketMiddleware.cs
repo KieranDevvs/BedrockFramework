@@ -120,7 +120,8 @@ namespace Bedrock.Framework
     {
         /// <summary>
         /// Upgrades incoming HTTP/1.1 connections to WebSockets and runs the rest of the pipeline over the WebSocket:
-        /// downstream middleware sees message payloads as its transport, and each flush is sent as one message.
+        /// downstream middleware sees a byte stream of message payloads as its transport, and flushed output is sent as
+        /// messages (message boundaries are not preserved, see <see cref="WebSocketDuplexPipe"/>).
         /// The session is available through <see cref="IWebSocketSessionFeature"/>. Use after TLS middleware for wss://.
         /// </summary>
         /// <param name="builder">The connection builder.</param>
