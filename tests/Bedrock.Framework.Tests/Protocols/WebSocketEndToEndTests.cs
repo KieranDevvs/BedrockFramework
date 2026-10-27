@@ -349,6 +349,77 @@ public class WebSocketEndToEndTests
         }
     }
 
+    [Fact]
+    public async Task FailingAfterTheApplicationSentCloseStillDeliversTheCloseFrame()
+    {
+        var serviceProvider = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var server = new ServerBuilder(serviceProvider)
+            .UseSockets(sockets => sockets.Listen(IPAddress.Loopback, 0, builder => builder.RunWebSocket(async (session, _) =>
+            {
+                try
+                {
+                    await session.ReadMessageAsync();
+                    await session.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "app done");
+
+                    // Keep reading for the peer's Close; the peer misbehaves instead
+                    while ((await session.ReadMessageAsync()).MessageType != WebSocketMessageType.Close)
+                    {
+                    }
+                }
+                catch (WebSocketException)
+                {
+                }
+            }, options => options.KeepAliveInterval = TimeSpan.Zero)))
+            .Build();
+
+        await server.StartAsync();
+        try
+        {
+            var port = ((IPEndPoint)server.EndPoints.Single()).Port;
+            for (var attempt = 0; attempt < 15; attempt++)
+            {
+                using var client = new System.Net.Sockets.TcpClient { NoDelay = true };
+                await client.ConnectAsync(IPAddress.Loopback, port);
+                var stream = client.GetStream();
+
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                    $"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {WebSocketHandshake.GenerateKey()}\r\nSec-WebSocket-Version: 13\r\n\r\n"));
+                var head = new StringBuilder();
+                var one = new byte[1];
+                while (!head.ToString().EndsWith("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    await stream.ReadExactlyAsync(one);
+                    head.Append((char)one[0]);
+                }
+
+                // A valid masked text frame "a", then (without reading the server's Close) an unmasked frame and more data
+                await stream.WriteAsync(new byte[] { 0x81, 0x81, 1, 2, 3, 4, (byte)('a' ^ 1) });
+                await Task.Delay(50);
+                var violation = new byte[256 * 1024];
+                new byte[] { 0x81, 0x02, (byte)'h', (byte)'i' }.CopyTo(violation, 0);
+                try
+                {
+                    await stream.WriteAsync(violation);
+                }
+                catch (System.IO.IOException)
+                {
+                    // The server may stop reading once it has failed the connection
+                }
+
+                var header = new byte[2];
+                await stream.ReadExactlyAsync(header).AsTask().WaitAsync(Timeout);
+                Assert.Equal(0x88, header[0]);
+                var body = new byte[header[1] & 0x7F];
+                await stream.ReadExactlyAsync(body).AsTask().WaitAsync(Timeout);
+                Assert.Equal(1000, System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(body));
+            }
+        }
+        finally
+        {
+            await server.StopAsync();
+        }
+    }
+
     private static async Task<(WebSocketMessageType, byte[])> ReceiveAsync(WebSocket socket)
     {
         var buffer = new byte[64 * 1024];

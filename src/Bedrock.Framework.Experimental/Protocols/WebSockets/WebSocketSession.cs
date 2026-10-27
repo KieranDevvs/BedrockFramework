@@ -806,11 +806,12 @@ public sealed class WebSocketSession : IAsyncDisposable
             }
         }
 
-        if (closeSent)
+        if (closeSent || _closeSent)
         {
             // Aborting the connection straight away can discard the Close frame before it is transmitted, and closing
             // a socket with unread input resets it. So half-close our side and briefly drain the peer's input
-            // ("lingering close") so the peer actually receives the status code (RFC 6455 7.1.7).
+            // ("lingering close") so the peer actually receives the Close frame (RFC 6455 7.1.7). This applies
+            // whether we just sent it or an earlier CloseOutputAsync did.
             try
             {
                 await CompleteOutputAsync().ConfigureAwait(false);
