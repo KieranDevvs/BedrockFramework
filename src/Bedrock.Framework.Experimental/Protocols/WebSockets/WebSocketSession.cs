@@ -809,18 +809,12 @@ public sealed class WebSocketSession : IAsyncDisposable
         if (closeSent || _closeSent)
         {
             // Aborting the connection straight away can discard the Close frame before it is transmitted, and closing
-            // a socket with unread input resets it. So half-close our side and briefly drain the peer's input
-            // ("lingering close") so the peer actually receives the Close frame (RFC 6455 7.1.7). This applies
-            // whether we just sent it or an earlier CloseOutputAsync did.
-            try
-            {
-                await CompleteOutputAsync().ConfigureAwait(false);
-                await DrainInputAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-            }
-            catch
-            {
-            }
-
+            // a socket while the peer is still sending resets it, which also discards the frame at the peer. So keep
+            // the connection open and drain the peer's input until it goes quiet ("lingering close") before giving it
+            // up, so the peer actually receives the Close frame (RFC 6455 7.1.7). Output is deliberately not completed
+            // here: some transports (Bedrock's socket transport among them) shut down both directions when the output
+            // completes, which would reset the connection while the peer is still sending.
+            await DrainInputAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             AbortCore(abortConnection: false);
         }
         else
